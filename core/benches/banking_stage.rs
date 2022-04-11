@@ -113,16 +113,36 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
     let _unused = Blockstore::destroy(&ledger_path);
 }
 
-fn make_accounts_txs(txes: usize, mint_keypair: &Keypair, hash: Hash) -> Vec<Transaction> {
+fn make_accounts_txs(
+    txes: usize,
+    batch_size: usize,
+    mint_keypair: &Keypair,
+    hash: Hash,
+    tx_type: TransactionType,
+) -> Vec<Transaction> {
     let to_pubkey = pubkey::new_rand();
+    let batch_pubkeys: Vec<pubkey::Pubkey> =
+        (0..txes / batch_size).map(|_| pubkey::new_rand()).collect();
     let dummy = system_transaction::transfer(mint_keypair, &to_pubkey, 1, hash);
+    let target_pubkey = |i| match tx_type {
+        TransactionType::AccountsContentionFull => to_pubkey,
+        TransactionType::AccountsContentionIndependentBatches => batch_pubkeys[i / batch_size],
+        TransactionType::AccountsContentionTwoPerBatch => {
+            if i % batch_size <= 1 {
+                batch_pubkeys[i / batch_size]
+            } else {
+                pubkey::new_rand()
+            }
+        }
+        _ => pubkey::new_rand(),
+    };
     (0..txes)
         .into_par_iter()
-        .map(|_| {
+        .map(|i| {
             let mut new = dummy.clone();
             let sig: Vec<_> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
             new.message.account_keys[0] = pubkey::new_rand();
-            new.message.account_keys[1] = pubkey::new_rand();
+            new.message.account_keys[1] = target_pubkey(i);
             new.signatures = vec![Signature::new(&sig[0..64])];
             new
         })
@@ -146,18 +166,31 @@ fn make_programs_txs(txes: usize, hash: Hash) -> Vec<Transaction> {
         .collect()
 }
 
+#[derive(PartialEq, Clone, Copy)]
 enum TransactionType {
-    Accounts,
+    // all transactions can run in parallel
+    AccountsNoContention,
+    // each batch has exactly two tx that want to write lock the same account
+    AccountsContentionTwoPerBatch,
+    // each batch contains tx that all write lock the same account, but the
+    // batches are independent
+    AccountsContentionIndependentBatches,
+    // all transactions write-lock the same account
+    AccountsContentionFull,
     Programs,
 }
 
-fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
+fn bench_banking(
+    bencher: &mut Bencher,
+    packets_per_batch: usize,
+    batches_per_iter: usize,
+    tx_type: TransactionType,
+) {
     solana_logger::setup();
     let num_threads = BankingStage::num_threads() as usize;
     //   a multiple of packet chunk duplicates to avoid races
     const CHUNKS: usize = 8;
-    const PACKETS_PER_BATCH: usize = 192;
-    let txes = PACKETS_PER_BATCH * num_threads * CHUNKS;
+    let txes = packets_per_batch * batches_per_iter * CHUNKS;
     let mint_total = 1_000_000_000_000;
     let GenesisConfigInfo {
         mut genesis_config,
@@ -167,7 +200,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
 
     // Set a high ticks_per_slot so we don't run out of ticks
     // during the benchmark
-    genesis_config.ticks_per_slot = 10_000;
+    genesis_config.ticks_per_slot = 100_000;
 
     let (verified_sender, verified_receiver) = unbounded();
     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
@@ -185,7 +218,16 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
     debug!("threads: {} txs: {}", num_threads, txes);
 
     let transactions = match tx_type {
-        TransactionType::Accounts => make_accounts_txs(txes, &mint_keypair, genesis_config.hash()),
+        TransactionType::AccountsNoContention
+        | TransactionType::AccountsContentionFull
+        | TransactionType::AccountsContentionTwoPerBatch
+        | TransactionType::AccountsContentionIndependentBatches => make_accounts_txs(
+            txes,
+            packets_per_batch,
+            &mint_keypair,
+            genesis_config.hash(),
+            tx_type,
+        ),
         TransactionType::Programs => make_programs_txs(txes, genesis_config.hash()),
     };
 
@@ -206,13 +248,17 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
         assert!(res.is_ok(), "sanity test transactions");
     });
     bank.clear_signatures();
-    //sanity check, make sure all the transactions can execute in parallel
-    let res = bank.process_transactions(transactions.iter());
-    for r in res {
-        assert!(r.is_ok(), "sanity parallel execution");
+    if tx_type == TransactionType::AccountsNoContention || tx_type == TransactionType::Programs {
+        //sanity check, make sure all the transactions can execute in parallel
+        let res = bank.process_transactions(transactions.iter());
+        for r in res {
+            assert!(r.is_ok(), "sanity parallel execution");
+        }
+        bank.clear_signatures();
     }
-    bank.clear_signatures();
-    let verified: Vec<_> = to_packet_batches(&transactions, PACKETS_PER_BATCH);
+    let verified: Vec<_> = to_packet_batches(&transactions, packets_per_batch);
+    assert_eq!(verified.len(), CHUNKS * batches_per_iter);
+
     let ledger_path = get_tmp_ledger_path!();
     {
         let blockstore = Arc::new(
@@ -239,7 +285,6 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
         );
         poh_recorder.lock().unwrap().set_bank(&bank);
 
-        let chunk_len = verified.len() / CHUNKS;
         let mut start = 0;
 
         // This is so that the signal_receiver does not go out of scope after the closure.
@@ -251,11 +296,11 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             let now = Instant::now();
             let mut sent = 0;
 
-            for v in verified[start..start + chunk_len].chunks(chunk_len / num_threads) {
+            for v in verified[start..start + batches_per_iter].chunks(1) {
                 debug!(
                     "sending... {}..{} {} v.len: {}",
                     start,
-                    start + chunk_len,
+                    start + batches_per_iter,
                     timestamp(),
                     v.len(),
                 );
@@ -276,7 +321,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
                 txes / CHUNKS,
                 sent,
             );
-            start += chunk_len;
+            start += batches_per_iter;
             start %= verified.len();
         });
         drop(tpu_vote_sender);
@@ -287,14 +332,75 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
     let _unused = Blockstore::destroy(&ledger_path);
 }
 
-#[bench]
-fn bench_banking_stage_multi_accounts(bencher: &mut Bencher) {
-    bench_banking(bencher, TransactionType::Accounts);
+fn bench_banking_scaled(bencher: &mut Bencher, packets_per_batch: usize, tx_type: TransactionType) {
+    // ensure the total number of packets does not change when packets_per_batch
+    // is adjusted
+    bench_banking(
+        bencher,
+        packets_per_batch,
+        4 * 192 / packets_per_batch,
+        tx_type,
+    )
 }
 
 #[bench]
-fn bench_banking_stage_multi_programs(bencher: &mut Bencher) {
-    bench_banking(bencher, TransactionType::Programs);
+fn bench_banking_stage_batch_size_192_multi_accounts_no_contention(bencher: &mut Bencher) {
+    bench_banking_scaled(bencher, 192, TransactionType::AccountsNoContention);
+}
+
+#[bench]
+fn bench_banking_stage_batch_size_192_multi_accounts_contention_full(bencher: &mut Bencher) {
+    bench_banking_scaled(bencher, 192, TransactionType::AccountsContentionFull);
+}
+
+#[bench]
+fn bench_banking_stage_batch_size_192_multi_accounts_contention_independent_batches(
+    bencher: &mut Bencher,
+) {
+    bench_banking_scaled(
+        bencher,
+        192,
+        TransactionType::AccountsContentionIndependentBatches,
+    );
+}
+
+#[bench]
+fn bench_banking_stage_batch_size_192_multi_accounts_contention_two_per_batch(
+    bencher: &mut Bencher,
+) {
+    bench_banking_scaled(bencher, 192, TransactionType::AccountsContentionTwoPerBatch);
+}
+
+#[bench]
+fn bench_banking_stage_batch_size_12__multi_accounts_no_contention(bencher: &mut Bencher) {
+    bench_banking_scaled(bencher, 12, TransactionType::AccountsNoContention);
+}
+
+#[bench]
+fn bench_banking_stage_batch_size_12_multi_accounts_contention_full(bencher: &mut Bencher) {
+    bench_banking_scaled(bencher, 12, TransactionType::AccountsContentionFull);
+}
+
+#[bench]
+fn bench_banking_stage__batch_size_12_multi_accounts_contention_independent_batches(
+    bencher: &mut Bencher,
+) {
+    bench_banking_scaled(
+        bencher,
+        12,
+        TransactionType::AccountsContentionIndependentBatches,
+    );
+}
+
+#[bench]
+fn bench_banking_stage__batch_size_12_multi_accounts_contention_two_per_batch(
+    bencher: &mut Bencher,
+) {
+    bench_banking_scaled(bencher, 12, TransactionType::AccountsContentionTwoPerBatch);
+}
+#[bench]
+fn bench_banking_stage__batch_size_192_multi_programs(bencher: &mut Bencher) {
+    bench_banking_scaled(bencher, 192, TransactionType::Programs);
 }
 
 fn simulate_process_entries(
