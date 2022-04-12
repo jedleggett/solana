@@ -372,7 +372,7 @@ fn bench_banking_stage_batch_size_192_multi_accounts_contention_two_per_batch(
 }
 
 #[bench]
-fn bench_banking_stage_batch_size_12__multi_accounts_no_contention(bencher: &mut Bencher) {
+fn bench_banking_stage_batch_size_12_multi_accounts_no_contention(bencher: &mut Bencher) {
     bench_banking_scaled(bencher, 12, TransactionType::AccountsNoContention);
 }
 
@@ -382,7 +382,7 @@ fn bench_banking_stage_batch_size_12_multi_accounts_contention_full(bencher: &mu
 }
 
 #[bench]
-fn bench_banking_stage__batch_size_12_multi_accounts_contention_independent_batches(
+fn bench_banking_stage_batch_size_12_multi_accounts_contention_independent_batches(
     bencher: &mut Bencher,
 ) {
     bench_banking_scaled(
@@ -393,13 +393,13 @@ fn bench_banking_stage__batch_size_12_multi_accounts_contention_independent_batc
 }
 
 #[bench]
-fn bench_banking_stage__batch_size_12_multi_accounts_contention_two_per_batch(
+fn bench_banking_stage_batch_size_12_multi_accounts_contention_two_per_batch(
     bencher: &mut Bencher,
 ) {
     bench_banking_scaled(bencher, 12, TransactionType::AccountsContentionTwoPerBatch);
 }
 #[bench]
-fn bench_banking_stage__batch_size_192_multi_programs(bencher: &mut Bencher) {
+fn bench_banking_stage_batch_size_192_multi_programs(bencher: &mut Bencher) {
     bench_banking_scaled(bencher, 192, TransactionType::Programs);
 }
 
